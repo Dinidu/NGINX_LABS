@@ -5,11 +5,103 @@
 | Project | CLIENT NGINX Plus: additional nodes (2 → 6) |
 | Use when | CLIENT's licence for the new nodes is **not ready yet**, and the new VMs must be prepared now |
 | Runs on | Your **laptop**, the existing **Node 1** (<NODE1_IP>), and each **new node** (Nodes 3–6) |
-| Input | `~/<PROJECT_DIR>/bundles/nginx-plus-r36-9-el9-offline.tar.gz` + `.sha256` on your laptop |
+| Input | First choice: existing RPMs found on Node 1 (section P). Fallback: `~/<PROJECT_DIR>/bundles/nginx-plus-r36-9-el9-offline.tar.gz` + `.sha256` on your laptop |
 | Result | NGINX Plus and nginx-sync **installed but not started**, no licence on the node. Finish with SOP-02 when the licence arrives |
 | Status | Bundle validated in the lab (SOP-01, SOP-02 on `lab-n2`, 16 Oct 2026). This staged flow is a subset of SOP-02 |
 
 This SOP is **production only**. There are no trial steps. Run every command on a server as **root** (`sudo -i`), **one line at a time**, and check the prompt (`[root@<hostname> ~]#`) before each step.
+
+---
+
+## P. Start here: look for existing NGINX Plus RPMs on Node 1
+
+The original install of Node 1 may have left its RPMs (or an offline bundle) on the server. If a complete, matching set is there, use it instead of the laptop bundle. It came from CLIENT's own subscription and is already the exact build Node 1 runs.
+
+Steps P.1–P.3 only read, and change nothing. They were checked on `lab-n1` (20 Oct 2026): they found the SOP-02 bundle folder, with 98 RPMs, `repodata`, one `nginx-plus-1:36-9.el9.ngx`, and all signatures OK. ⚠️ P.4–P.5 were **not run in the lab**.
+
+**P.1 On Node 1: record how NGINX Plus was installed:**
+
+```bash
+rpm -q nginx-plus nginx-sync
+dnf info --installed nginx-plus | grep -iE '^(version|release|from repo)'
+dnf history info nginx-plus | grep -iE 'begin time|command line'
+grep -rHiE '^\[|baseurl' /etc/yum.repos.d/
+```
+
+What it tells you:
+- `From repo : @commandline`: installed from RPM files given on the command line. The `Command Line` from `dnf history` often shows the folder they were in.
+- A repo name with a `baseurl=file:///...` line: installed from a local repo folder. That folder is the first place to look.
+- Any other name (for example `offline`) with `--repofrompath=<name>,<folder>` in the `Command Line`: installed from that folder, the way SOP-02 does it. Look there first.
+- `nginx-plus` (with a `pkgs.nginx.com` baseurl): installed online from F5. There may be no RPM files left on the server.
+
+**P.2 On Node 1: search the server for NGINX RPMs and bundles:**
+
+```bash
+find / \( -path /proc -o -path /sys -o -path /run -o -path /dev \) -prune -o \( -name 'nginx-plus*.rpm' -o -name 'nginx-sync*.rpm' -o -name '*nginx*.tar.gz' -o -name '*nginx*.tgz' \) -print 2>/dev/null | xargs -r ls -lh
+```
+
+- Ignore `.tgz` / `.tar.gz` files that are config backups (for example `nginx-etc-backup-*.tgz`, a few KB). A package bundle is tens of MB.
+- 🔍 Nothing found: **use the laptop bundle.** Go to section 0.
+- 🔍 Found: note the **folder** that holds the RPMs (or the archive), and continue with P.3. A `.tar.gz` bundle: unpack a copy in `/tmp` first (`mkdir /tmp/node1-check && tar xzf <ARCHIVE> -C /tmp/node1-check`) and use the folder with the RPMs inside.
+
+**P.3 On Node 1: check the folder is complete and matches.** Set `D` to the folder found in P.2:
+
+```bash
+D=<FOLDER_WITH_THE_RPMS>
+ls $D/*.rpm | wc -l
+ls -d $D/repodata 2>/dev/null || echo "no repodata"
+rpm -qp --qf '%{NAME}-%{EPOCH}:%{VERSION}-%{RELEASE}.%{ARCH}\n' $D/nginx-*.rpm
+rpm -K $D/*.rpm | grep -v 'digests signatures OK' || echo "ALL SIGNATURES OK"
+```
+
+✅ **Use it** only if all are true:
+- Exactly one `nginx-plus-1:<build>`, the **same build** as `rpm -q nginx-plus` in P.1 (no R37 or other builds mixed in).
+- An `nginx-sync` RPM is there.
+- `ALL SIGNATURES OK`.
+
+Otherwise (a lone `nginx-plus` RPM, a different build, failed signatures): **use the laptop bundle.** Go to section 0.
+
+Record the folder, RPM count and result in the record sheet. Then do sections 0–2 as normal (rules, Node 1 go/no-go, new node checks), plus SOP-02 steps 2.1–2.3 (root SSH from Node 1), before P.4.
+
+**P.4 On Node 1: package the folder and copy it to the new node:**
+
+```bash
+cd /root
+tar czf node1-nginx-rpms.tar.gz -C $D .
+sha256sum node1-nginx-rpms.tar.gz > node1-nginx-rpms.tar.gz.sha256
+scp node1-nginx-rpms.tar.gz node1-nginx-rpms.tar.gz.sha256 root@<NEW_NODE>:/root/
+```
+
+If F5's signing key is not in the folder (`ls $D/*.key`), also copy it from the laptop bundle. On your **laptop**: `cd ~/<PROJECT_DIR>/bundles && tar xzf nginx-plus-r36-9-el9-offline.tar.gz nginx-bundle/nginx_signing.key`, then copy `nginx-bundle/nginx_signing.key` to `/root/` on the new node (same path as section 3.2).
+
+**P.5 On the new node: verify, unpack and install:**
+
+```bash
+cd /root
+sha256sum -c node1-nginx-rpms.tar.gz.sha256
+mkdir -p /root/node1-rpms && tar xzf node1-nginx-rpms.tar.gz -C /root/node1-rpms
+rpm --import /root/node1-rpms/*.key 2>/dev/null || rpm --import /root/nginx_signing.key
+rpm -K /root/node1-rpms/*.rpm | grep -v 'digests signatures OK' || echo "ALL SIGNATURES OK"
+```
+
+✅ Expect: `OK`, then `ALL SIGNATURES OK`. Set the build from P.3 (for example `NGX_VER=1:36-9.el9.ngx`), then pick the case that matches P.3:
+
+The folder **has `repodata`**: run the section 4.3 and 4.4 commands, replacing `/root/nginx-bundle/rpms` with `/root/node1-rpms`.
+
+The folder has **no `repodata`**: install the two RPM files directly (dry run first):
+
+```bash
+dnf --disablerepo='*' install --assumeno /root/node1-rpms/nginx-plus-${NGX_VER#*:}.x86_64.rpm /root/node1-rpms/nginx-sync-*.rpm
+```
+
+```bash
+dnf --disablerepo='*' install -y /root/node1-rpms/nginx-plus-${NGX_VER#*:}.x86_64.rpm /root/node1-rpms/nginx-sync-*.rpm
+```
+
+- 🛑 Dry run says `nothing provides ...` or `Problem: ... requires ...`: a dependency is missing from the folder. **Stop** and use the laptop bundle (section 3 onwards).
+- 🛑 Dry run shows an `Upgrading:` section with core packages: stop, as in section 4.3.
+
+When the install succeeds, run the checks at the end of **section 4.4** (`rpm -q`, `nginx -v`, `dnf history list`), then continue from **section 4.5**. Skip sections 3, 4.1–4.4 (they are for the laptop bundle).
 
 ---
 
@@ -246,6 +338,9 @@ rpm -q nginx-plus nginx-sync
 | Item | Value |
 |---|---|
 | Date / performed by | |
+| Node 1 install source: `From repo` / baseurl (P.1) | |
+| Existing RPMs found on Node 1: folder / RPM count / signatures (P.2–P.3) | |
+| Source used: Node 1 RPMs (P.4–P.5) or laptop bundle (3–4) | |
 | CLIENT written approval to install from bundle (ref / date) | |
 | Node 1: `rpm -q nginx-plus` / RHEL release (1.1) | |
 | GO / NO-GO (1.1) | |
