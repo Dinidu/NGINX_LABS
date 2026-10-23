@@ -8,7 +8,14 @@
 | Input | NGINX Plus installed on the new nodes (SOP-04) or the offline bundle, the new nodes' `license.jwt`, CLIENT approvals (section 0) |
 | Status | Install, licence, start and test steps are from SOP-02 (validated on `lab-n2`, 16 Oct 2026). The `sysadmin` sections (2, 6, 8, 9) are written from F5's `/usr/bin/nginx-sync.sh` (nginx-sync 1.1). ⚠️ **They have not yet been run in the lab.** Rehearse them on `lab-n1` / `lab-n2` before using them on CLIENT nodes |
 
-Run commands as **root** (`sudo -i`) unless a step says **as `sysadmin`**. Paste **one line at a time**, and check the prompt before every step: `[root@<host> ~]#` or `[sysadmin@<host> ~]$`. Keep one terminal per server.
+**How you work on CLIENT nodes:** SSH in as **`sysadmin`**, then become root with `sudo su`. Run commands as **root** unless a step says **as `sysadmin`**. Paste **one line at a time**, and check the prompt before every step. Keep one terminal per server.
+
+| Prompt | You are | How to get there |
+|---|---|---|
+| `[sysadmin@<host> ~]$` | `sysadmin` | The SSH login itself, or `exit` from the root shell |
+| `[root@<host> sysadmin]#` | root | `sudo su` from the `sysadmin` login. The folder stays `/home/sysadmin` (`su` without `-` does not change folder), so the prompt shows `sysadmin` and not `~` |
+
+For steps **as `sysadmin`**: type `exit` to drop from root back to your `sysadmin` login, run the step, then `sudo su` again. Or stay root and use `su - sysadmin -c '<command>'`, as the steps below do. Both are the same account.
 
 If SOP-04 and SOP-05 are already done on a new node, skip the steps they cover (marked ⏭️).
 
@@ -25,13 +32,15 @@ When `nginx-sync.sh` is started by a **non-root** user, it automatically switche
 | Local checks and backups (`nginx -t`, `/var/lib/nginx-sync`) | `sudo` on Node 1 | Passwordless sudo on Node 1 |
 | Lock file `/tmp/nginx-sync.lock`, log file (`-l`) | `sysadmin` **without** sudo | The log file writable by `sysadmin`. No stale root-owned lock file |
 
-Run it **as `sysadmin` and without `sudo`** (`su - sysadmin`, then `nginx-sync.sh …`). `sudo nginx-sync.sh` runs as root and goes back to root SSH.
+Run it **as `sysadmin` and without `sudo`**: from the `sysadmin` login **before** `sudo su` (or after `exit` from root), or from root with `su - sysadmin`. ❌ Not from the `sudo su` root shell, and not as `sudo nginx-sync.sh`: both run it as root, which goes back to root SSH.
 
 **For CLIENT's security team (be explicit):** F5's script itself says that running as non-root with sudo *"is no more secure than running as root"*. Passwordless `sudo rsync`, `rm` or `sed` can change any file. What CLIENT gains: **no root SSH login**, every action logged by sudo under a named account, and access revocable by disabling one account. What does not change: **`sysadmin` is root-equivalent on all six nodes**, and its private key on Node 1 must be protected as a root credential.
 
+`sysadmin` is **already** CLIENT's admin login, with `sudo su` to root on every node. So nginx-sync adds **no new privilege**: it uses an account that can already become root. What it adds is an unattended **key** login from Node 1 to the other nodes as `sysadmin`, and (if `sudo su` asks for a password today) passwordless sudo for the specific nginx-sync commands only (2.2). Anyone who can log in to Node 1 as `sysadmin` can then reach all nodes without a password. That is the point for CLIENT to accept.
+
 **Approvals needed before section 2 (record them):**
-1. The `sysadmin` account on all six nodes (CLIENT may already have one: see 2.1).
-2. The sudoers rule in 2.2 on all six nodes.
+1. Using CLIENT's existing `sysadmin` admin account as the nginx-sync account on all six nodes.
+2. The sudoers rule in 2.2 on all six nodes (only if `sudo` needs a password today: see 2.1).
 3. `sysadmin` key login from Node 1 to Nodes 2–6.
 4. A change window for switching the **existing** Node 1 → Node 2 sync to `sysadmin` (section 2 on Node 2, then section 9).
 
@@ -95,16 +104,16 @@ A denial: `ausearch -m avc -ts recent | audit2why`. The usual fixes are `setsebo
 
 Do 2.1–2.2 on **every node** (Node 1, Node 2, and each new node). Do 2.3–2.8 on **Node 1**, once per peer: **Node 2 first** (so the existing sync is proven), then each new node. The root path keeps working throughout, so you can roll back.
 
-**2.1 On every node: check whether `sysadmin` exists and what it may do:**
+**2.1 On every node: record what `sysadmin`'s sudo allows.** First, note whether `sudo su` asked for `sysadmin`'s password when you logged in. Then, as root:
 
 ```bash
 id sysadmin
 sudo -l -U sysadmin
 ```
 
-- `no such user`: create it, if CLIENT approves: `useradd -m -c "nginx-sync service account" sysadmin`.
-- The user exists and `sudo -l` shows `(ALL) NOPASSWD: ALL`: CLIENT already grants full passwordless sudo. The rule in 2.2 is not needed. Record this.
-- The user exists and sudo needs a password (no `NOPASSWD`): add the rule in 2.2. nginx-sync runs unattended and cannot answer a password prompt.
+- `sudo su` did **not** ask for a password, and `sudo -l` shows `(ALL) NOPASSWD: ALL`: `sysadmin` already has full passwordless sudo. **Skip 2.2.** Record this.
+- `sudo su` **asked** for a password (no `NOPASSWD` in `sudo -l`): **do 2.2.** nginx-sync runs unattended and cannot answer a password prompt. The rule in 2.2 makes only the nginx-sync commands passwordless. `sudo su` keeps asking for the password as before.
+- `sudo -l` shows a rule that only allows `su` (for example `(ALL) /bin/su`): **do 2.2.** nginx-sync calls `sudo rsync`, `sudo nginx` etc. directly, not through `su`.
 
 **2.2 On every node: install the sudoers rule (if 2.1 says it is needed).** Paste the whole block, including the closing `EOF` line:
 
@@ -137,10 +146,25 @@ visudo -c; sudo -l -U sysadmin | tail -6
 
 ✅ Expect: `parsed OK` (twice), and the `NOPASSWD` command list. If CLIENT's own sudoers names `sysadmin` too, show them this file and agree the final rule with them.
 
-**2.3 On Node 1: create `sysadmin`'s RSA key** (if it does not exist). The file name **must** be `id_rsa`, because the script hard-codes `$HOME/.ssh/id_rsa` for the config copy:
+**2.3 On Node 1: `sysadmin`'s RSA key.** The file name **must** be `id_rsa`, because the script hard-codes `$HOME/.ssh/id_rsa` for the config copy. `sysadmin` is a shared admin login, so a key may already be there. Check first:
 
 ```bash
-su - sysadmin -c 'ls ~/.ssh/id_rsa.pub 2>/dev/null || ssh-keygen -t rsa -b 4096 -N "" -C "nginx-sync@$(hostname)" -f ~/.ssh/id_rsa'
+ls -l /home/sysadmin/.ssh/
+```
+
+If `id_rsa` **exists**, check it has no passphrase (nginx-sync cannot type one):
+
+```bash
+su - sysadmin -c 'ssh-keygen -y -P "" -f ~/.ssh/id_rsa >/dev/null && echo "no passphrase - usable" || echo "has a passphrase - NOT usable"'
+```
+
+- `usable`: reuse it. Ask CLIENT who else uses this key, and record it.
+- `NOT usable`: don't change or overwrite it (it belongs to someone). Raise it with CLIENT.
+
+If `id_rsa` does **not** exist, create it:
+
+```bash
+su - sysadmin -c 'ssh-keygen -t rsa -b 4096 -N "" -C "nginx-sync@$(hostname)" -f ~/.ssh/id_rsa'
 ```
 
 ```bash
@@ -477,7 +501,12 @@ When section 7 passes: **Phase 3**. Add the node to the F5 pools **disabled**, t
 
 ## 8. Running nginx-sync from now on
 
-Always: log in to Node 1, `su - sysadmin`, then `nginx-sync.sh -C` before and after `nginx-sync.sh -l /var/log/nginx-sync.log`. Config changes are still made as root on Node 1. Only the sync runs as `sysadmin`.
+Always:
+1. SSH to Node 1 as `sysadmin`, then `sudo su`, and make the config change as root. Test it with `nginx -t`.
+2. `exit` back to `sysadmin` (prompt `[sysadmin@<node1> ~]$`).
+3. Run `nginx-sync.sh -C`, then `nginx-sync.sh -l /var/log/nginx-sync.log`, then `nginx-sync.sh -C` again.
+
+❌ Don't run nginx-sync from the `sudo su` root shell.
 
 ---
 
@@ -523,7 +552,7 @@ Whether to disable root SSH entirely (`PermitRootLogin no`) or delete root's key
 | Item | Node 2 | Node 3 | Node 4 | Node 5 | Node 6 |
 |---|---|---|---|---|---|
 | CLIENT approvals (section 0), ref / date | | | | | |
-| `sysadmin` existed / created; sudo as found (2.1) | | | | | |
+| `sudo su` asks password? / `sudo -l` result (2.1) | | | | | |
 | Sudoers rule installed, `parsed OK` (2.2) | | | | | |
 | Key authorised (2.4) | | | | | |
 | Host key accepted as `sysadmin` + root (2.5) | | | | | |
@@ -541,4 +570,4 @@ Whether to disable root SSH entirely (`PermitRootLogin no`) or delete root's key
 | Reboot (7.7) | | | | | |
 | Root key removed, `root-rc=255` (9) | | | | | |
 
-Node 1 (once): `sysadmin` key created (2.3) ☐ · local `sudo -n` OK (2.7) ☐ · log file owned by `sysadmin`, no stale lock (2.8) ☐ · `nginx-sync.conf` backup name (6.1): ________
+Node 1 (once): `sysadmin` `id_rsa` reused (no passphrase) / created (2.3) ☐ · local `sudo -n` OK (2.7) ☐ · log file owned by `sysadmin`, no stale lock (2.8) ☐ · `nginx-sync.conf` backup name (6.1): ________
