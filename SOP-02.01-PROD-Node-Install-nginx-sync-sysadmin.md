@@ -238,7 +238,99 @@ su - sysadmin
 nginx-sync.sh -C
 ```
 
-✅ Expect: the `Comparing configs on master node and sysadmin@<NODE2>:` header with **no differences** and no `Permission denied`. 🛑 Differences: someone changed Node 2 directly. Stop and investigate before any sync. Type `exit` to return to root.
+✅ Expect: the `Comparing configs on master node and sysadmin@<NODE2>:` header with **no differences** and no `Permission denied`. 🛑 **Any difference: do 2.10 before any sync.** Type `exit` to return to root.
+
+**2.10 If `nginx-sync.sh -C` shows a difference: understand it before syncing.** ❌ **Never run `nginx-sync.sh` (without `-C`) while a difference is unexplained.** A sync makes every peer an exact copy of Node 1 (`rsync --delete`). Anything that exists only on the peer is **overwritten or deleted**. nginx-sync keeps only **one** copy of the peer's previous config, in `/var/lib/nginx-sync/` on the peer, and the **next** sync replaces it. Don't rely on it: save your own copy in d).
+
+Do this on Node 1, as `sysadmin`, for each peer that shows differences.
+
+**a) Read what kind of difference it is.** The format, as seen in the lab:
+
+```text
+Files local:/etc/nginx/conf.d/jwt-config.conf and remote:/etc/nginx/conf.d/jwt-config.conf differ
+Only in local:/etc/nginx/conf.d: zz-local-only.conf
+Only in remote:/etc/nginx/conf.d: zz-remote-only.conf
+```
+
+`local:` = Node 1, `remote:` = the peer.
+
+| Line | Meaning | What a sync will do to the peer |
+|---|---|---|
+| `Files local:X and remote:X differ` | The file is different on the two nodes | **Overwrite** the peer's file with Node 1's |
+| `Only in local:<dir>: <file>` | The file exists only on Node 1 | **Create** it on the peer |
+| `Only in remote:<dir>: <file>` | The file exists only on the peer | **Delete** it from the peer (unless it matches `EXCLUDE`) |
+
+**b) See the exact lines** for one peer (`-d` = full diff, `-c` = one node). Use the same name as in `NODES`:
+
+```bash
+nginx-sync.sh -d -c <PEER>
+```
+
+Lab example:
+
+```text
+--- local:/etc/nginx/conf.d/jwt-config.conf
++++ remote:/etc/nginx/conf.d/jwt-config.conf
+@@ -216,3 +216,4 @@
+         proxy_pass https://objstorage.client.int:9443;
+     }
+ }
++# changed directly on lab-n2
+```
+
+- Lines starting with **`-`** exist only on **Node 1**. The sync will **add** them to the peer.
+- Lines starting with **`+`** exist only on the **peer**. The sync will **remove** them from the peer.
+- Lines starting with a space are the same on both (context).
+
+To read an "Only in remote" file, or the whole peer file:
+
+```bash
+ssh sysadmin@<PEER> 'sudo cat <FULL_PATH_OF_FILE>'
+```
+
+**c) Find out when it changed, and by whom.** On the peer, then on Node 1:
+
+```bash
+ssh sysadmin@<PEER> 'sudo stat -c "%y %U %n" <FULL_PATH_OF_FILE>'
+```
+
+```bash
+sudo stat -c "%y %U %n" <FULL_PATH_OF_FILE>
+```
+
+```bash
+ssh sysadmin@<PEER> 'sudo journalctl _COMM=sudo --since "<DATE FROM stat> 00:00" --until "<DATE FROM stat> 23:59" --no-pager | grep -i nginx | tail -20'
+```
+
+The newer timestamp tells you which side was changed last. The `journalctl` output shows who ran `sudo` commands touching nginx on that day.
+
+**d) Save the peer's current config** before any decision, so nothing is lost:
+
+```bash
+ssh sysadmin@<PEER> 'sudo tar czf - /etc/nginx 2>/dev/null' > ~/peer-<PEER>-etc-nginx-$(date +%F-%H%M).tgz
+```
+
+```bash
+ls -l ~/peer-*.tgz
+```
+
+**e) Decide with CLIENT, and record the decision:**
+
+| Finding | Typical cause | Action |
+|---|---|---|
+| `+` lines / "Only in remote" are a **wanted** change (for example a hotfix made directly on Node 2) | Someone edited the peer and never copied it to Node 1 | **Copy the change into Node 1 first** (as root on Node 1, then `nginx -t`). Re-run `nginx-sync.sh -C` until that difference is gone. Only then sync |
+| `+` lines / "Only in remote" are **unwanted** or stale (old test file, leftover) | Leftovers from earlier work | Get CLIENT's OK **in writing** that the peer's version can be discarded. Keep the `.tgz` from d). Then the sync can overwrite or delete it |
+| `-` lines / "Only in local" that nobody expected | Someone edited Node 1 but never synced. The change is **not live** on the peers, and may not be finished | Ask CLIENT whether that change is meant to go live **now**. Syncing pushes it to every peer. If it isn't ready, don't sync until it is fixed or reverted on Node 1 |
+| "Only in local" for a **new node** (6.2) | The new node has no site config yet | Expected. This is what the sync is for |
+| A file that should never be synced (for example `license.jwt`) | `EXCLUDE` is missing it | **Stop.** Fix `EXCLUDE` in `/etc/nginx-sync.conf` (6.1) before any sync |
+
+**f) Compare again.** Sync only when every remaining difference is understood and approved:
+
+```bash
+nginx-sync.sh -C
+```
+
+Record each difference, the decision, who approved it, and the `.tgz` file name in the record sheet.
 
 ---
 
@@ -381,7 +473,7 @@ su - sysadmin
 nginx-sync.sh -C
 ```
 
-✅ Expect: `Only in local:` lines for the files the new node does not have yet, and **no** differences for any node already in sync.
+✅ Expect: `Only in local:` lines for the files the new node does not have yet, and **no** differences for any node already in sync. 🛑 Anything else (`differ`, `Only in remote`, or any difference on Node 2): **do 2.10 first.**
 
 ```bash
 nginx-sync.sh -l /var/log/nginx-sync.log
@@ -503,7 +595,8 @@ When section 7 passes: **Phase 3**. Add the node to the F5 pools **disabled**, t
 Always:
 1. SSH to Node 1 as `sysadmin`, then `sudo su`, and make the config change as root. Test it with `nginx -t`.
 2. `exit` back to `sysadmin` (prompt `[sysadmin@<node1> ~]$`).
-3. Run `nginx-sync.sh -C`, then `nginx-sync.sh -l /var/log/nginx-sync.log`, then `nginx-sync.sh -C` again.
+3. Run `nginx-sync.sh -C`. If it shows any difference you did not just make yourself, follow **2.10** before going on.
+4. `nginx-sync.sh -l /var/log/nginx-sync.log`, then `nginx-sync.sh -C` again.
 
 ❌ Don't run nginx-sync from the `sudo su` root shell.
 
@@ -557,6 +650,7 @@ Whether to disable root SSH entirely (`PermitRootLogin no`) or delete root's key
 | Host key accepted as `sysadmin` + root (2.5) | | | | | |
 | `sudo -n` checks OK on peer (2.6) | | | | | |
 | `nginx-sync.sh -C` as `sysadmin` clean (2.9 / 6.2) | | | | | |
+| Differences found: file / type / decision / approved by / `.tgz` (2.10) | | | | | |
 | RHEL / SELinux row (1.1–1.3) | | | | | |
 | Build / `nginx -v` match Node 1 (4) | | | | | |
 | Licence `sub` differs from Node 1, not eval (4.4) | | | | | |
